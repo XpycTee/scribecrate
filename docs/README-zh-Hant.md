@@ -192,6 +192,15 @@ CPU 映像支援 `linux/amd64` 和 `linux/arm64`。`:cuda` 標籤僅支援 `linu
 | `WHISPER_LOG_LEVEL` | 日誌等級：`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。 | `INFO` |
 | `WHISPER_BEAM` | 轉錄和翻譯解碼的 beam 大小。較大的值可能以速度換取精確度。使用 `1` 可獲得最快的貪婪解碼。 | `5` |
 | `WHISPER_MAX_REQUEST_BEAM` | 每個請求的 `beam` 覆寫值允許的最大 beam 大小。設為 `0` 可停用此限制。 | `10` |
+| `WHISPER_VAD_FILTER` | 啟用語音活動偵測（VAD）過濾。可透過請求的 `vad_filter` 表單欄位覆寫。 | `true` |
+| `WHISPER_VAD_THRESHOLD` | Silero 語音機率閾值（`0`–`1`）。 | `0.5` |
+| `WHISPER_VAD_NEG_THRESHOLD` | 用於判斷語音結束的選用靜音機率閾值（`0`–`1`）。 | 函式庫預設值 |
+| `WHISPER_VAD_MIN_SPEECH_DURATION_MS` | 捨棄短於此毫秒數的偵測語音片段。 | `0` |
+| `WHISPER_VAD_MAX_SPEECH_DURATION_S` | 語音片段的最長時間（秒）；過長片段會被分割。 | 不限 |
+| `WHISPER_VAD_MIN_SILENCE_DURATION_MS` | 分割語音片段所需的最短靜音時間（毫秒）。 | `2000` |
+| `WHISPER_VAD_SPEECH_PAD_MS` | 在偵測到的語音片段兩端新增的填充時間（毫秒）。 | `400` |
+| `WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH` | 達到最大片段時間時，用來避免突然截斷的最短靜音時間（毫秒）。 | `98` |
+| `WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH` | 達到最大片段時間時是否使用最長可用靜音區間。 | `true` |
 | `WHISPER_CONDITION_ON_PREVIOUS_TEXT` | 使用前一視窗的文字作為解碼上下文。設為 `false` 可能減少重複回饋循環，但也可能降低視窗間的一致性。 | `true` |
 | `WHISPER_NO_REPEAT_NGRAM_SIZE` | 限制解碼中的重複 token n-gram。`0` 表示停用；接受 `0` 至 `2147483647` 的標準十進位整數。n-gram 是模型 token 的序列，不一定對應完整的單字。 | `0` |
 | `WHISPER_MAX_UPLOAD_MB` | 上傳音訊檔案的最大大小（MB）。超過此限制的請求會返回 HTTP 413。設為 `0` 可停用此限制。 | `1024` |
@@ -205,6 +214,8 @@ CPU 映像支援 `linux/amd64` 和 `linux/arm64`。`:cuda` 標籤僅支援 `linu
 | `WHISPER_DISABLE_USAGE_COUNTS` | 設為 `1` 可停用匿名彙總使用計數。 | *（未設定）* |
 
 **注：** 在 `env` 檔案中，值可用單引號括起，例如 `VAR='value'`。`=` 兩側不要有空格。如更改 `WHISPER_PORT`，請相應更新 `docker run` 指令中的 `-p` 參數。
+
+VAD 選項與 [faster-whisper](https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/vad.py) 支援的 `VadOptions` 一致。
 
 重複控制適用於轉錄和翻譯的批次及 SSE 路徑。對於容易重複的錄音，可嘗試 `WHISPER_CONDITION_ON_PREVIOUS_TEXT=false` 和 `WHISPER_NO_REPEAT_NGRAM_SIZE=3`。這可能抑制正常重複或降低解碼視窗間的一致性，不能保證消除幻覺。
 
@@ -352,10 +363,14 @@ Content-Type: multipart/form-data
 | `prompt` | 字串 | — | 選用文字，用於引導模型風格或延續前一段內容。 |
 | `response_format` | 字串 | — | 輸出格式，預設為 `json`。請參閱[回應格式](#回應格式)。`stream=true` 時忽略此參數。不支援 OpenAI 專用的 `diarized_json`。 |
 | `temperature` | 浮點數 | — | 採樣溫度（0–1），預設為 `0`。 |
+| `vad_filter` | 布林值 | — | faster-whisper 本地擴充。為此請求啟用或停用 VAD 過濾；可設為 `true` 或 `false`。省略時使用 `WHISPER_VAD_FILTER`。 |
+| `vad_parameters` | JSON 物件 | — | faster-whisper 本地擴充。使用上表中的選項名稱覆寫此請求的 VAD 設定（例如 `{"min_silence_duration_ms":500}`）。未指定的選項使用 `WHISPER_VAD_*` 設定或 faster-whisper 預設值。 |
 | `stream` | 布林值 | — | 啟用 SSE 串流。為 `true` 時，段落將在解碼時以 `text/event-stream` 事件形式回傳。預設為 `false`。 |
 | `timestamp_granularities[]` | 陣列 | — | 時間戳粒度。值：`word`、`segment`。包含 `word` 時，`verbose_json` 輸出包含頂層 `words` 陣列。預設：`["segment"]`。 |
 
-**本地 faster-whisper 擴充：** 可設定 `beam`，為單一轉錄或翻譯請求覆寫 `WHISPER_BEAM`。這不是 OpenAI API 架構的一部分，因此不要將其傳送到託管的 OpenAI API 或嚴格相容 OpenAI 的閘道。每請求預設上限為 `10`（`WHISPER_MAX_REQUEST_BEAM`）；將該變數設為 `0` 可停用上限。Beam 搜尋主要影響 `temperature=0` 時的確定性解碼。
+**本地 faster-whisper 擴充：** 可設定 `beam` 覆寫 `WHISPER_BEAM`、`vad_filter` 覆寫 `WHISPER_VAD_FILTER`，或透過 `vad_parameters` 覆寫單一轉錄或翻譯請求的 VAD 參數。這些參數不屬於 OpenAI API 架構，因此不要將其傳送到託管的 OpenAI API 或嚴格相容 OpenAI 的閘道。每請求預設 beam 上限為 `10`（`WHISPER_MAX_REQUEST_BEAM`）；將該變數設為 `0` 可停用上限。Beam 搜尋主要影響 `temperature=0` 時的確定性解碼。
+
+例如，可傳入 `-F 'vad_parameters={"min_silence_duration_ms":500,"speech_pad_ms":200}'` 來調整單一請求。
 
 **範例：**
 

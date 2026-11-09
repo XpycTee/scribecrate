@@ -12,6 +12,7 @@ from test_api_validation import api_server, _FakeModel, _FakeUpload
 
 CONDITION = "WHISPER_CONDITION_ON_PREVIOUS_TEXT"
 NGRAM = "WHISPER_NO_REPEAT_NGRAM_SIZE"
+VAD_FILTER = "WHISPER_VAD_FILTER"
 VALID = [
     ("", "", True, 0),
     ("true", "0", True, 0),
@@ -37,7 +38,7 @@ class DecodingOptionTests(unittest.TestCase):
         self.saved = (
             api_server._condition_on_previous_text, api_server._no_repeat_ngram_size
         )
-        self.env = mock.patch.dict(os.environ, {CONDITION: "", NGRAM: ""})
+        self.env = mock.patch.dict(os.environ, {CONDITION: "", NGRAM: "", VAD_FILTER: ""})
         self.env.start()
 
     def tearDown(self):
@@ -78,9 +79,11 @@ class DecodingOptionTests(unittest.TestCase):
         async def start():
             async with api_server._lifespan(api_server.app):
                 self.fail("Invalid configuration must not begin serving")
-        for name, value in ((CONDITION, "yes"), (NGRAM, "2147483648")):
+        for name, value in (
+            (CONDITION, "yes"), (NGRAM, "2147483648"), (VAD_FILTER, "yes")
+        ):
             with self.subTest(name=name):
-                os.environ.update({CONDITION: "", NGRAM: "", name: value})
+                os.environ.update({CONDITION: "", NGRAM: "", VAD_FILTER: "", name: value})
                 with mock.patch.object(api_server, "_load_model") as load_model:
                     with mock.patch.object(api_server, "_load_diarizer", create=True) as diarizer:
                         with self.assertRaisesRegex(ValueError, name):
@@ -102,6 +105,118 @@ class DecodingOptionTests(unittest.TestCase):
                 asyncio.run(start())
 
 
+class VadFilterOptionTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = api_server._vad_filter, api_server._vad_parameters
+        self.env = mock.patch.dict(os.environ, {
+            VAD_FILTER: "",
+            **{name: "" for name in api_server._VAD_PARAMETER_ENV.values()},
+        })
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        api_server._vad_filter, api_server._vad_parameters = self.saved
+
+    def test_environment_values_and_default(self):
+        for value, expected in (("", True), ("true", True), ("FALSE", False), ("TrUe", True)):
+            with self.subTest(value=value):
+                os.environ[VAD_FILTER] = value
+                api_server._load_vad_options()
+                self.assertIs(api_server._vad_filter, expected)
+
+    def test_invalid_environment_value_fails(self):
+        for value in ("yes", "1", "true false", "'false", "true\nfalse", "\u00a0false"):
+            with self.subTest(value=value):
+                os.environ[VAD_FILTER] = value
+                with self.assertRaisesRegex(ValueError, VAD_FILTER):
+                    api_server._load_vad_options()
+
+    def test_environment_parameters_override_library_defaults(self):
+        os.environ.update({
+            "WHISPER_VAD_THRESHOLD": "0.65",
+            "WHISPER_VAD_NEG_THRESHOLD": "0.35",
+            "WHISPER_VAD_MIN_SPEECH_DURATION_MS": "120",
+            "WHISPER_VAD_MAX_SPEECH_DURATION_S": "30",
+            "WHISPER_VAD_MIN_SILENCE_DURATION_MS": "500",
+            "WHISPER_VAD_SPEECH_PAD_MS": "250",
+            "WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH": "100",
+            "WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH": "false",
+        })
+        api_server._load_vad_options()
+        self.assertEqual(api_server._vad_parameters, {
+            "threshold": 0.65,
+            "neg_threshold": 0.35,
+            "min_speech_duration_ms": 120,
+            "max_speech_duration_s": 30,
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 250,
+            "min_silence_at_max_speech": 100,
+            "use_max_poss_sil_at_max_speech": False,
+        })
+
+    def test_invalid_environment_parameters_fail(self):
+        for name, value in (
+            ("WHISPER_VAD_THRESHOLD", "1.1"),
+            ("WHISPER_VAD_NEG_THRESHOLD", "nope"),
+            ("WHISPER_VAD_MIN_SPEECH_DURATION_MS", "-1"),
+            ("WHISPER_VAD_MAX_SPEECH_DURATION_S", "inf"),
+            ("WHISPER_VAD_MIN_SILENCE_DURATION_MS", "1.5"),
+            ("WHISPER_VAD_SPEECH_PAD_MS", "2147483648"),
+            ("WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH", "01"),
+            ("WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH", "yes"),
+        ):
+            with self.subTest(name=name, value=value):
+                os.environ[name] = value
+                with self.assertRaisesRegex(ValueError, name):
+                    api_server._load_vad_options()
+                os.environ[name] = ""
+
+    def test_request_value_overrides_environment_default(self):
+        api_server._vad_filter = False
+        self.assertIs(api_server._resolve_request_vad_filter(None), False)
+        self.assertIs(api_server._resolve_request_vad_filter(" TRUE "), True)
+        self.assertIs(api_server._resolve_request_vad_filter("false"), False)
+
+    def test_invalid_request_value_returns_bad_request(self):
+        for value in ("", "yes", "1", "false true"):
+            with self.subTest(value=value):
+                with self.assertRaises(api_server.HTTPException) as ctx:
+                    api_server._resolve_request_vad_filter(value)
+                self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_request_parameters_override_environment_individually(self):
+        api_server._vad_parameters = {
+            "min_silence_duration_ms": 750,
+            "speech_pad_ms": 100,
+        }
+        self.assertEqual(
+            api_server._resolve_request_vad_parameters(
+                '{"min_silence_duration_ms":500,"threshold":0.65}'
+            ),
+            {
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 100,
+                "threshold": 0.65,
+            },
+        )
+        self.assertEqual(
+            api_server._resolve_request_vad_parameters(None),
+            {"min_silence_duration_ms": 750, "speech_pad_ms": 100},
+        )
+
+    def test_invalid_request_parameters_return_bad_request(self):
+        for value in (
+            "not-json", "[]", '{"unknown":1}', '{"threshold":1.1}',
+            '{"min_speech_duration_ms":-1}', '{"speech_pad_ms":true}',
+            '{"use_max_poss_sil_at_max_speech":"false"}',
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(api_server.HTTPException) as ctx:
+                    api_server._resolve_request_vad_parameters(value)
+                self.assertEqual(ctx.exception.status_code, 400)
+
+
 class DecodingPropagationTests(unittest.TestCase):
     def setUp(self):
         self.patches = []
@@ -109,6 +224,8 @@ class DecodingPropagationTests(unittest.TestCase):
             ("_model", _FakeModel()), ("_model_name", "base"),
             ("_beam_size", 5), ("_max_request_beam", 10), ("_max_upload_bytes", 0),
             ("_condition_on_previous_text", True), ("_no_repeat_ngram_size", 0),
+            ("_vad_filter", True),
+            ("_vad_parameters", {}),
         ):
             patch = mock.patch.object(api_server, name, value)
             patch.start()
@@ -123,11 +240,12 @@ class DecodingPropagationTests(unittest.TestCase):
             patch.stop()
 
     def test_batch_sse_by_task_defaults_and_overrides(self):
-        async def request(task, stream):
+        async def request(task, stream, vad_filter=None):
             response = await api_server._handle_audio(
                 task=task, file=_FakeUpload(), model="whisper-1", language=None,
                 prompt=None, response_format="json", temperature=0,
                 stream="true" if stream else None, beam=None,
+                vad_filter=vad_filter,
             )
             if stream:
                 frames = [frame async for frame in response.body_iterator]
@@ -148,6 +266,43 @@ class DecodingPropagationTests(unittest.TestCase):
                         self.assertEqual(call["task"], task)
                         self.assertIs(call["vad_filter"], True)
                         self.assertEqual(call["beam_size"], 5)
+
+    def test_request_vad_override_reaches_batch_and_streaming(self):
+        async def request(stream, vad_filter, vad_parameters=None):
+            response = await api_server._handle_audio(
+                task="transcribe", file=_FakeUpload(), model="whisper-1",
+                language=None, prompt=None, response_format="json", temperature=0,
+                stream="true" if stream else None, beam=None, vad_filter=vad_filter,
+                vad_parameters=vad_parameters,
+            )
+            if stream:
+                [frame async for frame in response.body_iterator]
+
+        api_server._vad_filter = False
+        for stream in (False, True):
+            for value, expected in (("true", True), ("false", False), (None, False)):
+                with self.subTest(stream=stream, value=value):
+                    asyncio.run(request(stream, value))
+                    self.assertIs(api_server._model.calls[-1]["vad_filter"], expected)
+
+    def test_request_vad_parameters_reach_batch_and_streaming(self):
+        async def request(stream):
+            response = await api_server._handle_audio(
+                task="transcribe", file=_FakeUpload(), model="whisper-1",
+                language=None, prompt=None, response_format="json", temperature=0,
+                stream="true" if stream else None, beam=None,
+                vad_parameters='{"min_silence_duration_ms":500}',
+            )
+            if stream:
+                [frame async for frame in response.body_iterator]
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                asyncio.run(request(stream))
+                self.assertEqual(
+                    api_server._model.calls[-1]["vad_parameters"],
+                    {"min_silence_duration_ms": 500},
+                )
 
     def test_sse_error_and_temp_cleanup(self):
         async def collect(path):
@@ -199,9 +354,11 @@ class ShellDecodingOptionTests(unittest.TestCase):
         script = (
             'exiterr() { echo "$1" >&2; exit 1; }\n' + helpers +
             '\nunset WHISPER_CONDITION_ON_PREVIOUS_TEXT WHISPER_NO_REPEAT_NGRAM_SIZE\n'
-            '. "$1"\nconfigure_decoding_options\n'
+            'unset WHISPER_VAD_FILTER\n'
+            '. "$1"\nconfigure_decoding_options\nconfigure_vad_filter\n'
             'exec "$2" -c \'import os; print(os.environ["' + CONDITION +
-            '"]); print(os.environ["' + NGRAM + '"])\'\n'
+            '"]); print(os.environ["' + NGRAM + '"]); print(os.environ["' +
+            VAD_FILTER + '"])\'\n'
         )
         with tempfile.TemporaryDirectory() as directory:
             config = pathlib.Path(directory) / "whisper.env"
@@ -209,19 +366,23 @@ class ShellDecodingOptionTests(unittest.TestCase):
             # quoting function, without evaluating expressions in the parser.
             def quote(value):
                 return "'" + value.replace("'", "'\"'\"'") + "'"
-            cases = [(c, n, True) for c, n, _, _ in VALID]
-            cases += [(v, "0", False) for v in BAD_CONDITION]
-            cases += [("true", v, False) for v in BAD_NGRAM]
-            for condition, ngram, valid in cases:
+            cases = [(c, n, v, True) for c, n, _, _ in VALID for v in ("", "FALSE")]
+            cases += [(v, "0", "", False) for v in BAD_CONDITION]
+            cases += [("true", v, "", False) for v in BAD_NGRAM]
+            cases += [("true", "0", v, False) for v in ("yes", "1", "false true")]
+            for condition, ngram, vad_filter, valid in cases:
                 config.write_text(
                     CONDITION + "=" + quote(condition) + "\n" +
-                    NGRAM + "=" + quote(ngram) + "\n"
+                    NGRAM + "=" + quote(ngram) + "\n" +
+                    VAD_FILTER + "=" + quote(vad_filter) + "\n"
                 )
                 result = subprocess.run(
                     ["bash", "-c", script, "decoding-test", str(config), sys.executable],
                     capture_output=True, text=True, timeout=10,
                 )
-                with self.subTest(condition=condition[:80], ngram=ngram[:80]):
+                with self.subTest(
+                    condition=condition[:80], ngram=ngram[:80], vad_filter=vad_filter[:80]
+                ):
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     if valid:
                         with mock.patch.dict(os.environ, {CONDITION: condition, NGRAM: ngram}):
@@ -229,7 +390,8 @@ class ShellDecodingOptionTests(unittest.TestCase):
                             self.assertEqual(
                                 result.stdout.splitlines(),
                                 [str(api_server._condition_on_previous_text).lower(),
-                                 str(api_server._no_repeat_ngram_size)],
+                                 str(api_server._no_repeat_ngram_size),
+                                 vad_filter.lower() if vad_filter else "true"],
                             )
                     else:
                         self.assertIn("WHISPER_", result.stderr)

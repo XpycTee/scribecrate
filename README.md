@@ -192,6 +192,15 @@ This Docker image uses the following variables, that can be declared in an `env`
 | `WHISPER_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. | `INFO` |
 | `WHISPER_BEAM` | Beam size for transcription and translation decoding. Higher values may improve accuracy at the cost of speed. Use `1` for fastest (greedy) decoding. | `5` |
 | `WHISPER_MAX_REQUEST_BEAM` | Maximum beam size allowed for the per-request `beam` override. Set to `0` to disable this limit. | `10` |
+| `WHISPER_VAD_FILTER` | Enable voice activity detection (VAD) filtering. Can be overridden per request with the local `vad_filter` form field. | `true` |
+| `WHISPER_VAD_THRESHOLD` | Silero speech probability threshold (`0`–`1`). | `0.5` |
+| `WHISPER_VAD_NEG_THRESHOLD` | Optional silence probability threshold (`0`–`1`) for ending speech. | Library default |
+| `WHISPER_VAD_MIN_SPEECH_DURATION_MS` | Discard detected speech chunks shorter than this duration in milliseconds. | `0` |
+| `WHISPER_VAD_MAX_SPEECH_DURATION_S` | Maximum speech chunk duration in seconds; longer chunks are split. | Unlimited |
+| `WHISPER_VAD_MIN_SILENCE_DURATION_MS` | Minimum silence duration in milliseconds required to split speech chunks. | `2000` |
+| `WHISPER_VAD_SPEECH_PAD_MS` | Padding in milliseconds added to both sides of detected speech. | `400` |
+| `WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH` | Minimum silence duration in milliseconds used to avoid abrupt cuts at the maximum chunk duration. | `98` |
+| `WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH` | Whether to use the maximum possible silence when splitting at the maximum chunk duration. | `true` |
 | `WHISPER_CONDITION_ON_PREVIOUS_TEXT` | Condition decoding windows on previous text. Setting `false` may reduce repetition feedback loops but can reduce consistency between windows. | `true` |
 | `WHISPER_NO_REPEAT_NGRAM_SIZE` | Restrict repeated token n-grams within decoding. `0` disables this restriction; canonical decimal integer `0` through `2147483647`. N-grams are sequences of model tokens, not necessarily whole words. | `0` |
 | `WHISPER_MAX_UPLOAD_MB` | Maximum uploaded audio file size in MB. Requests above this limit return HTTP 413. Set to `0` to disable the limit. | `1024` |
@@ -204,11 +213,13 @@ This Docker image uses the following variables, that can be declared in an `env`
 | `WHISPER_DIARIZE_THRESHOLD` | Clustering threshold for auto-detection. Lower = more speakers detected, higher = fewer. Ignored when exact speaker count is set. | `0.5` |
 | `WHISPER_DISABLE_USAGE_COUNTS` | Set to `1` to disable anonymous aggregate usage counts. | *(not set)* |
 
+VAD options mirror the `VadOptions` supported by [faster-whisper](https://github.com/SYSTRAN/faster-whisper/blob/master/faster_whisper/vad.py).
+
 **Note:** In your `env` file, you may enclose values in single quotes, e.g. `VAR='value'`. Do not add spaces around `=`. If you change `WHISPER_PORT`, update the `-p` flag in the `docker run` command accordingly.
 
 The repetition controls apply to transcription and translation, both batch and SSE. For repetition-prone recordings, optionally try `WHISPER_CONDITION_ON_PREVIOUS_TEXT=false` and `WHISPER_NO_REPEAT_NGRAM_SIZE=3`. This may suppress legitimate repeated speech or reduce consistency between decoding windows; it does not guarantee hallucination-free output.
 
-These settings accept surrounding ASCII whitespace and at most one matching pair of outer quotes. Empty values use defaults. Booleans accept ASCII case-insensitive `true`/`false`; integers must use ASCII digits, without signs or leading zeros. Invalid nonempty values stop startup before model loading.
+These settings accept surrounding ASCII whitespace and at most one matching pair of outer quotes. Empty values use defaults. Booleans, including `WHISPER_VAD_FILTER`, accept ASCII case-insensitive `true`/`false`; integers must use ASCII digits, without signs or leading zeros. Invalid nonempty values stop startup before model loading.
 
 A bind-mounted `api_server.py` overrides the API bundled with the image. Remove the mount to use the bundled API, or update your custom copy when upgrading. When replacing scripts manually, use `api_server.py`, `diarizer.py`, and `diarization_models.py` from the same revision.
 
@@ -352,10 +363,14 @@ Content-Type: multipart/form-data
 | `prompt` | string | — | Optional text to guide the model's style or continue a previous segment. |
 | `response_format` | string | — | Output format. Default: `json`. See [response formats](#response-formats). Ignored when `stream=true`. OpenAI-only `diarized_json` is not supported. |
 | `temperature` | float | — | Sampling temperature (0–1). Default: `0`. |
+| `vad_filter` | boolean | — | Local faster-whisper extension. Enable or disable VAD filtering for this request; `true` or `false`. Omit to use `WHISPER_VAD_FILTER`. |
+| `vad_parameters` | JSON object | — | Local faster-whisper extension. Override VAD options for this request, using the option names listed above (for example `{"min_silence_duration_ms":500}`). Unspecified options use `WHISPER_VAD_*` settings or faster-whisper defaults. |
 | `stream` | boolean | — | Enable SSE streaming. When `true`, segments are returned as `text/event-stream` events as they are decoded. Default: `false`. |
 | `timestamp_granularities[]` | array | — | Timestamp granularities to populate. Values: `word`, `segment`. When `word` is included, `verbose_json` output includes a top-level `words` array. Default: `["segment"]`. |
 
-**Local faster-whisper extension:** You can set `beam` to override `WHISPER_BEAM` for a single transcription or translation request. This is not part of the OpenAI API schema, so do not send it to the hosted OpenAI API or strict OpenAI-compatible gateways. The default per-request cap is `10` (`WHISPER_MAX_REQUEST_BEAM`); set that variable to `0` to disable the cap. Beam search mainly affects deterministic decoding when `temperature=0`.
+**Local faster-whisper extensions:** You can set `beam` to override `WHISPER_BEAM`, `vad_filter` to override `WHISPER_VAD_FILTER`, and `vad_parameters` to override individual VAD settings for a single transcription or translation request. These are not part of the OpenAI API schema, so do not send them to the hosted OpenAI API or strict OpenAI-compatible gateways. The default per-request beam cap is `10` (`WHISPER_MAX_REQUEST_BEAM`); set that variable to `0` to disable the cap. Beam search mainly affects deterministic decoding when `temperature=0`.
+
+For example, send `-F 'vad_parameters={"min_silence_duration_ms":500,"speech_pad_ms":200}'` to tune one request.
 
 **Example:**
 

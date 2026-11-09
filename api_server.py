@@ -15,6 +15,7 @@ See: https://opensource.org/licenses/MIT
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -49,6 +50,8 @@ _model = None       # WhisperModel instance
 _model_name = None  # name as loaded (e.g. "base")
 _beam_size = 5      # beam size used for transcription
 _max_request_beam = 10  # maximum per-request beam override; 0 disables the cap
+_vad_filter = True  # default for voice activity detection filtering
+_vad_parameters = {}
 _word_timestamps = False  # default for word-level timestamps
 _condition_on_previous_text = True  # preserve faster-whisper's decoding default
 _no_repeat_ngram_size = 0  # 0 disables repeated token n-gram restrictions
@@ -60,6 +63,23 @@ _DIARIZE_EMBEDDING_MODELS = tuple(EMBEDDING_MODELS)
 _max_upload_bytes = 1024 * 1024 * 1024  # 1 GiB by default; 0 disables the limit
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
 _UNSUPPORTED_DIARIZE_MODEL = "gpt-4o-transcribe-diarize"
+_VAD_PARAMETER_ENV = {
+    "threshold": "WHISPER_VAD_THRESHOLD",
+    "neg_threshold": "WHISPER_VAD_NEG_THRESHOLD",
+    "min_speech_duration_ms": "WHISPER_VAD_MIN_SPEECH_DURATION_MS",
+    "max_speech_duration_s": "WHISPER_VAD_MAX_SPEECH_DURATION_S",
+    "min_silence_duration_ms": "WHISPER_VAD_MIN_SILENCE_DURATION_MS",
+    "speech_pad_ms": "WHISPER_VAD_SPEECH_PAD_MS",
+    "min_silence_at_max_speech": "WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH",
+    "use_max_poss_sil_at_max_speech": "WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH",
+}
+_VAD_INTEGER_PARAMETERS = frozenset({
+    "min_speech_duration_ms",
+    "min_silence_duration_ms",
+    "speech_pad_ms",
+    "min_silence_at_max_speech",
+})
+_VAD_BOOLEAN_PARAMETERS = frozenset({"use_max_poss_sil_at_max_speech"})
 
 # Serialise all inference calls (batch and streaming) so that CTranslate2 is
 # never called concurrently from multiple threads.
@@ -168,6 +188,123 @@ def _load_decoding_options() -> None:
     )
 
 
+def _load_vad_options() -> None:
+    """Resolve VAD settings before loading the model."""
+    global _vad_filter, _vad_parameters
+
+    value = _normalized_env_option("WHISPER_VAD_FILTER")
+    value = value.translate(str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
+    ))
+    if value not in ("", "true", "false"):
+        raise ValueError("WHISPER_VAD_FILTER must be true or false.")
+    vad_filter_enabled = value != "false"
+
+    parameters = {}
+    for parameter, env_name in _VAD_PARAMETER_ENV.items():
+        value = _normalized_env_option(env_name)
+        if not value:
+            continue
+        if parameter in _VAD_BOOLEAN_PARAMETERS:
+            normalized = value.translate(str.maketrans(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
+            ))
+            if normalized not in ("true", "false"):
+                raise ValueError(f"{env_name} must be true or false.")
+            value = normalized == "true"
+        elif parameter in _VAD_INTEGER_PARAMETERS:
+            if (
+                re.fullmatch(r"0|[1-9][0-9]*", value) is None
+                or len(value) > 10
+                or (len(value) == 10 and value > "2147483647")
+            ):
+                raise ValueError(
+                    f"{env_name} must be an integer from 0 to 2147483647."
+                )
+            value = int(value)
+        elif parameter in ("threshold", "neg_threshold"):
+            try:
+                value = float(value)
+            except ValueError as exc:
+                raise ValueError(f"{env_name} must be a number from 0 to 1.") from exc
+        elif parameter == "max_speech_duration_s":
+            try:
+                value = float(value)
+            except ValueError as exc:
+                raise ValueError(f"{env_name} must be a positive number.") from exc
+
+        try:
+            parameters.update(_validated_vad_parameters({parameter: value}))
+        except ValueError as exc:
+            raise ValueError(f"{env_name}: {exc}") from exc
+
+    _vad_filter = vad_filter_enabled
+    _vad_parameters = parameters
+    logger.info("VAD filter: %s | parameters=%s", _vad_filter, _vad_parameters)
+
+
+def _validated_vad_parameters(parameters: dict) -> dict:
+    """Validate keys, types, and ranges accepted by faster-whisper VadOptions."""
+    unknown = set(parameters) - set(_VAD_PARAMETER_ENV)
+    if unknown:
+        raise ValueError(
+            "Unsupported VAD parameter(s): "
+            + ", ".join(sorted(unknown))
+            + "."
+        )
+
+    normalized = {}
+    for name, value in parameters.items():
+        if name in _VAD_BOOLEAN_PARAMETERS:
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean.")
+        elif name in _VAD_INTEGER_PARAMETERS:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 2147483647
+            ):
+                raise ValueError(f"{name} must be an integer from 0 to 2147483647.")
+        elif name in ("threshold", "neg_threshold"):
+            if value is None and name == "neg_threshold":
+                normalized[name] = None
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number from 0 to 1.")
+            try:
+                value = float(value)
+            except OverflowError as exc:
+                raise ValueError(f"{name} must be a number from 0 to 1.") from exc
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be a number from 0 to 1.")
+        elif name == "max_speech_duration_s":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a positive number.")
+            try:
+                value = float(value)
+            except OverflowError as exc:
+                raise ValueError(f"{name} must be a positive number.") from exc
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive number.")
+        normalized[name] = value
+    return normalized
+
+
+def _resolve_request_vad_parameters(vad_parameters: Optional[str]) -> dict:
+    """Overlay validated JSON VAD options on the environment defaults."""
+    parameters = dict(_vad_parameters)
+    if vad_parameters is None:
+        return parameters
+    try:
+        request_parameters = json.loads(vad_parameters)
+        if not isinstance(request_parameters, dict):
+            raise ValueError("vad_parameters must be a JSON object.")
+        parameters.update(_validated_vad_parameters(request_parameters))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return parameters
+
+
 def _load_diarization_options() -> None:
     """Resolve options before model loading, outside optional-load error handling."""
     global _diarize_threads, _diarize_embedding_model
@@ -261,6 +398,7 @@ def _load_model() -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     _load_decoding_options()
+    _load_vad_options()
     _load_diarization_options()
     _load_model()
     _load_diarizer()
@@ -395,6 +533,22 @@ def _resolve_request_beam(beam: Optional[str]) -> int:
     return request_beam
 
 
+def _resolve_request_vad_filter(vad_filter: Optional[str]) -> bool:
+    """Resolve an optional per-request VAD override."""
+    if vad_filter is None:
+        return _vad_filter
+
+    value = vad_filter.strip(" \t\r\n\v\f").translate(str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
+    ))
+    if value not in ("true", "false"):
+        raise HTTPException(
+            status_code=400,
+            detail="vad_filter must be true or false.",
+        )
+    return value == "true"
+
+
 # ---------------------------------------------------------------------------
 # Timestamp helpers
 # ---------------------------------------------------------------------------
@@ -453,6 +607,8 @@ async def _stream_sse(
     temperature: float,
     beam_size: int,
     task: str = "transcribe",
+    vad_filter: bool = True,
+    vad_parameters: Optional[dict] = None,
 ):
     """
     Async generator that yields Server-Sent Events (SSE) frames using the
@@ -484,7 +640,8 @@ async def _stream_sse(
                     beam_size=beam_size,
                     condition_on_previous_text=_condition_on_previous_text,
                     no_repeat_ngram_size=_no_repeat_ngram_size,
-                    vad_filter=True,
+                    vad_filter=vad_filter,
+                    vad_parameters=vad_parameters,
                 )
                 for seg in segs_gen:
                     loop.call_soon_threadsafe(seg_queue.put_nowait, seg)
@@ -573,6 +730,8 @@ async def _handle_audio(
     stream: Optional[str],
     beam: Optional[str],
     timestamp_granularities: Optional[List[str]] = None,
+    vad_filter: Optional[str] = None,
+    vad_parameters: Optional[str] = None,
 ):
     """
     Shared implementation for transcription and translation endpoints.
@@ -583,6 +742,8 @@ async def _handle_audio(
 
     _validate_temperature(temperature)
     request_beam = _resolve_request_beam(beam)
+    request_vad_filter = _resolve_request_vad_filter(vad_filter)
+    request_vad_parameters = _resolve_request_vad_parameters(vad_parameters)
 
     # Validate the loaded model before saving uploads or starting an SSE response.
     if task == "translate" and _model_name and _model_name.endswith(".en"):
@@ -669,9 +830,10 @@ async def _handle_audio(
         raise HTTPException(status_code=500, detail=f"Failed to save upload: {exc}") from exc
 
     logger.info(
-        "%s '%s' (%d bytes) | lang=%s format=%s stream=%s beam=%d word_ts=%s",
+        "%s '%s' (%d bytes) | lang=%s format=%s stream=%s beam=%d vad_filter=%s word_ts=%s",
         "Translating" if task == "translate" else "Transcribing",
-        original_name, upload_size, lang or "auto", response_format, stream_flag, request_beam, wt_flag,
+        original_name, upload_size, lang or "auto", response_format, stream_flag,
+        request_beam, request_vad_filter, wt_flag,
     )
 
     # ------------------------------------------------------------------
@@ -681,7 +843,11 @@ async def _handle_audio(
     # ------------------------------------------------------------------
     if stream_flag:
         return StreamingResponse(
-            _stream_sse(tmp_path, lang, prompt, temperature, request_beam, task),
+            _stream_sse(
+                tmp_path, lang, prompt, temperature, request_beam, task,
+                vad_filter=request_vad_filter,
+                vad_parameters=request_vad_parameters,
+            ),
             media_type="text/event-stream",
             headers={
                 "X-Accel-Buffering": "no",   # disable nginx proxy buffering
@@ -705,7 +871,8 @@ async def _handle_audio(
                     condition_on_previous_text=_condition_on_previous_text,
                     no_repeat_ngram_size=_no_repeat_ngram_size,
                     word_timestamps=wt_flag,
-                    vad_filter=True,
+                    vad_filter=request_vad_filter,
+                    vad_parameters=request_vad_parameters,
                 )
                 segments = list(segments_gen)  # consume the generator before the temp file is removed
 
@@ -840,6 +1007,20 @@ async def transcribe(
             "Omit to use WHISPER_BEAM."
         ),
     ),
+    vad_filter: Optional[str] = Form(
+        default=None,
+        description=(
+            "Local faster-whisper extension: enable or disable voice activity "
+            "detection filtering for this request. Omit to use WHISPER_VAD_FILTER."
+        ),
+    ),
+    vad_parameters: Optional[str] = Form(
+        default=None,
+        description=(
+            "Local faster-whisper extension: JSON object with VAD options such "
+            "as {\"min_silence_duration_ms\":500}. Omit to use WHISPER_VAD_*."
+        ),
+    ),
     stream: Optional[str] = Form(
         default=None,
         description=(
@@ -914,6 +1095,8 @@ async def transcribe(
         stream=stream,
         beam=beam,
         timestamp_granularities=timestamp_granularities,
+        vad_filter=vad_filter,
+        vad_parameters=vad_parameters,
     )
 
 
@@ -945,6 +1128,20 @@ async def translate(
         description=(
             "Local faster-whisper extension: per-request beam size. "
             "Omit to use WHISPER_BEAM."
+        ),
+    ),
+    vad_filter: Optional[str] = Form(
+        default=None,
+        description=(
+            "Local faster-whisper extension: enable or disable voice activity "
+            "detection filtering for this request. Omit to use WHISPER_VAD_FILTER."
+        ),
+    ),
+    vad_parameters: Optional[str] = Form(
+        default=None,
+        description=(
+            "Local faster-whisper extension: JSON object with VAD options such "
+            "as {\"min_silence_duration_ms\":500}. Omit to use WHISPER_VAD_*."
         ),
     ),
     stream: Optional[str] = Form(
@@ -981,6 +1178,8 @@ async def translate(
         temperature=temperature,
         stream=stream,
         beam=beam,
+        vad_filter=vad_filter,
+        vad_parameters=vad_parameters,
     )
 
 

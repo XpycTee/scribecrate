@@ -78,6 +78,18 @@ configure_decoding_options() {
   export WHISPER_CONDITION_ON_PREVIOUS_TEXT="$condition"
   export WHISPER_NO_REPEAT_NGRAM_SIZE="$ngram"
 }
+
+configure_vad_filter() {
+  local value LC_ALL=C
+  value=$(normalize_decoding_option "${WHISPER_VAD_FILTER:-}")
+  value=$(printf '%s' "$value" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  case "$value" in
+    '') value=true ;;
+    true|false) ;;
+    *) exiterr "WHISPER_VAD_FILTER must be true or false." ;;
+  esac
+  export WHISPER_VAD_FILTER="$value"
+}
 # End strict decoding option helpers.
 
 # Use the same normalization as the decoding settings, without changing legacy
@@ -285,6 +297,7 @@ if ! printf '%s' "$WHISPER_DIARIZE_THRESHOLD" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; 
 fi
 
 configure_decoding_options
+configure_vad_filter
 configure_diarization_threads
 configure_diarization_embedding_model
 
@@ -423,6 +436,15 @@ export WHISPER_MAX_REQUEST_BEAM
 export WHISPER_MAX_UPLOAD_MB
 export WHISPER_LOCAL_ONLY
 export WHISPER_WORD_TIMESTAMPS
+export WHISPER_VAD_FILTER
+export WHISPER_VAD_THRESHOLD
+export WHISPER_VAD_NEG_THRESHOLD
+export WHISPER_VAD_MIN_SPEECH_DURATION_MS
+export WHISPER_VAD_MAX_SPEECH_DURATION_S
+export WHISPER_VAD_MIN_SILENCE_DURATION_MS
+export WHISPER_VAD_SPEECH_PAD_MS
+export WHISPER_VAD_MIN_SILENCE_AT_MAX_SPEECH
+export WHISPER_VAD_USE_MAX_POSS_SIL_AT_MAX_SPEECH
 export WHISPER_DIARIZATION
 export WHISPER_DIARIZE_NUM_SPEAKERS
 export WHISPER_DIARIZE_THRESHOLD
